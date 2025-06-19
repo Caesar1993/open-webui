@@ -1371,12 +1371,15 @@ async def process_chat_response(
 
         # Handle as a background task
         async def post_response_handler(response, events):
+            # === ① NEW: 统一声明，全局共享 ===
+            reasoning_shown = False
             def serialize_content_blocks(content_blocks, raw=False):
                 content = ""
 
                 for block in content_blocks:
                     if block["type"] == "text":
-                        content = f"{content}{block['content'].strip()}\n"
+                        # content = f"{content}{block['content'].strip()}\n"
+                        content = f"{content}{block['content']}"
                     elif block["type"] == "tool_calls":
                         attributes = block.get("attributes", {})
 
@@ -1526,6 +1529,19 @@ async def process_chat_response(
 
             def tag_content_handler(content_type, tags, content, content_blocks):
                 end_flag = False
+
+                nonlocal reasoning_shown      # 👍 现在能找到外层变量
+
+                # --- 已出现过 spinner？直接把 <think> ... </think> 去标签化 ---
+                if content_type == "reasoning" and reasoning_shown:
+                    for start_tag, end_tag in tags:
+                        content = re.sub(rf"<{start_tag}.*?>", "", content, flags=re.DOTALL)
+                        content = re.sub(rf"<{end_tag}>", "", content, flags=re.DOTALL)
+                    if content_blocks:
+                        content_blocks[-1]["content"] += content
+                    else:
+                        content_blocks.append({"type": "text", "content": content})
+                    return content, content_blocks, False
 
                 def extract_attributes(tag_content):
                     """Extract attributes from a tag if they exist."""
@@ -1895,6 +1911,8 @@ async def process_chat_response(
                                                 "started_at": time.time(),
                                             }
                                             content_blocks.append(reasoning_block)
+                                            if content_type == "reasoning" and not reasoning_shown:
+                                                reasoning_shown = True
                                         else:
                                             reasoning_block = content_blocks[-1]
 
@@ -2368,6 +2386,26 @@ async def process_chat_response(
                         except Exception as e:
                             log.debug(e)
                             break
+
+                # ---------- 只保留第 1 个 reasoning ----------
+                def finalize_reasoning_blocks(blocks):
+                    fixed, first_found = [], False
+                    now = time.time()
+                    for blk in blocks:
+                        if blk["type"] != "reasoning":
+                            fixed.append(blk)
+                            continue
+                        if not first_found:
+                            first_found = True
+                            if blk.get("duration") is None:   # 没关 </think> 也强制完结
+                                blk["ended_at"] = now
+                                blk["duration"] = 0
+                            fixed.append(blk)
+                        # 第二个及以后直接丢弃
+                    return fixed
+
+                content_blocks = finalize_reasoning_blocks(content_blocks)
+                # --------------------------------------------
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 data = {
